@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useMemo } from 'react';
 import AuthenticatedLayout from '@/Layouts/AuthenticatedLayout';
 import { Head, useForm, router } from '@inertiajs/react';
 import Modal from '@/Components/Modal';
@@ -12,7 +12,7 @@ export default function Laporan({ auth, data, filters = {}, isLocked = false }) 
     const currentBulan = filters?.bulan || (new Date().getMonth() + 1).toString();
     const currentTahun = filters?.tahun || new Date().getFullYear().toString();
     const currentMinggu = filters?.minggu || 'all';
-    const currentKategori = filters?.kategori || 'Inti CSA';
+    const currentKategori = filters?.kategori || 'Global';
 
     const handleFilterChange = (key, value) => {
         router.get('/produksi/laporan', {
@@ -25,6 +25,45 @@ export default function Laporan({ auth, data, filters = {}, isLocked = false }) 
 
     const [isModalOpen, setIsModalOpen] = useState(false);
     const [exportType, setExportType] = useState('hari');
+
+    // Agregasi data per tanggal untuk kategori 'Global' (gabungan CSA, Agrinas, dan Brondol)
+    const globalAggregatedData = useMemo(() => {
+        if (currentKategori !== 'Global') return [];
+        const dateMap = {};
+        listData.forEach(item => {
+            const tgl = item.tanggal;
+            if (!dateMap[tgl]) {
+                dateMap[tgl] = {
+                    tanggal: tgl,
+                    tonaseCSA: 0,
+                    totalCSA: 0,
+                    tonaseAgrinas: 0,
+                    totalAgrinas: 0,
+                    tonaseBrondol: 0,
+                    totalBrondol: 0,
+                    tonase: 0,
+                    total: 0
+                };
+            }
+            const kat = (item.kategori || '').toLowerCase();
+            const tns = parseFloat(String(item.tonase).replace(/[^0-9.-]/g, '')) || 0;
+            const tot = parseFloat(String(item.total).replace(/[^0-9.-]/g, '')) || 0;
+
+            if (kat.includes('csa')) {
+                dateMap[tgl].tonaseCSA += tns;
+                dateMap[tgl].totalCSA += tot;
+            } else if (kat.includes('agrinas')) {
+                dateMap[tgl].tonaseAgrinas += tns;
+                dateMap[tgl].totalAgrinas += tot;
+            } else if (kat.includes('brondol')) {
+                dateMap[tgl].tonaseBrondol += tns;
+                dateMap[tgl].totalBrondol += tot;
+            }
+            dateMap[tgl].tonase += tns;
+            dateMap[tgl].total += tot;
+        });
+        return Object.values(dateMap).sort((a, b) => a.tanggal.localeCompare(b.tanggal));
+    }, [listData, currentKategori]);
 
     const formatNumberID = (val) => {
         if (val === null || val === undefined || val === '') return '';
@@ -48,7 +87,7 @@ export default function Laporan({ auth, data, filters = {}, isLocked = false }) 
 
     const { data: formData, setData, post, processing, reset, transform: transformData } = useForm({
         tanggal: new Date().toISOString().split('T')[0],
-        kategori: currentKategori,
+        kategori: currentKategori === 'Global' ? 'Inti CSA' : currentKategori,
         harga_per_kg: '',
         tonase: '',
         total: ''
@@ -80,12 +119,26 @@ export default function Laporan({ auth, data, filters = {}, isLocked = false }) 
         setData(prevData => ({
             ...prevData,
             tanggal: new Date().toISOString().split('T')[0],
-            kategori: currentKategori,
+            kategori: currentKategori === 'Global' ? 'Inti CSA' : currentKategori,
             harga_per_kg: '',
             tonase: '',
             total: ''
         }));
         setIsModalOpen(true);
+    };
+
+    const handleImportClick = () => {
+        if (currentKategori === 'Global') {
+            Swal.fire({
+                title: 'Pilih Kategori Spesifik',
+                text: 'Untuk import data Excel, silakan pilih tab kategori spesifik terlebih dahulu (Inti CSA, Agrinas, atau Brondol).',
+                icon: 'info',
+                confirmButtonText: 'Mengerti',
+                confirmButtonColor: '#10b981'
+            });
+            return;
+        }
+        fileInputRef.current?.click();
     };
 
     const submit = (e) => {
@@ -429,7 +482,460 @@ export default function Laporan({ auth, data, filters = {}, isLocked = false }) 
         reader.readAsBinaryString(file);
     };
 
+    const exportGlobalPDF = async () => {
+        let sourceData = [];
+
+        if (currentKategori === 'Global') {
+            sourceData = listData;
+        } else {
+            try {
+                Swal.fire({
+                    title: 'Menyiapkan PDF Global...',
+                    text: 'Sedang memuat data gabungan CSA, Agrinas, dan Brondol.',
+                    allowOutsideClick: false,
+                    didOpen: () => {
+                        Swal.showLoading();
+                    }
+                });
+
+                const res = await window.axios.get('/produksi/laporan/global-data', {
+                    params: {
+                        bulan: currentBulan,
+                        tahun: currentTahun,
+                        minggu: currentMinggu
+                    }
+                });
+                sourceData = res.data || [];
+                Swal.close();
+            } catch (err) {
+                console.error('Error fetching global data:', err);
+                Swal.fire({
+                    title: 'Gagal!',
+                    text: 'Gagal mengambil data gabungan untuk ekspor PDF.',
+                    icon: 'error'
+                });
+                return;
+            }
+        }
+
+        if (!sourceData || sourceData.length === 0) {
+            Swal.fire({
+                title: 'Data Kosong',
+                text: 'Tidak ada data laporan gabungan untuk periode terpilih.',
+                icon: 'info'
+            });
+            return;
+        }
+
+        await generateGlobalPDF(sourceData);
+    };
+
+    const generateGlobalPDF = async (sourceData) => {
+        const { jsPDF } = await import('jspdf');
+        const autoTable = (await import('jspdf-autotable')).default;
+        const { kopSuratBase64 } = await import('@/utils/kopSuratBase64');
+        const doc = new jsPDF();
+        
+        // --- KOP SURAT ---
+        doc.addImage(kopSuratBase64, 'PNG', 0, 0, 210, 297);
+        
+        // --- JUDUL LAPORAN ---
+        let reportTitle = "LAPORAN PRODUKSI HARIAN GLOBAL (CSA, AGRINAS & BRONDOL)";
+        if (exportType === 'minggu') reportTitle = "LAPORAN PRODUKSI MINGGUAN GLOBAL (CSA, AGRINAS & BRONDOL)";
+        if (exportType === 'bulan') reportTitle = "LAPORAN PRODUKSI BULANAN GLOBAL (CSA, AGRINAS & BRONDOL)";
+        
+        doc.setFontSize(11);
+        doc.setFont("helvetica", "bold");
+        doc.text(reportTitle, 105, 52, { align: "center" });
+        doc.setFontSize(10);
+        doc.setFont("helvetica", "normal");
+        const monthNames = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember"];
+        const namaBulan = currentBulan === 'all' ? "Semua Bulan" : monthNames[parseInt(currentBulan) - 1];
+        const namaMinggu = currentMinggu === 'all' ? "" : `(Minggu ${currentMinggu})`;
+        doc.text(`Periode: ${namaBulan} ${currentTahun} ${namaMinggu}`, 105, 58, { align: "center" });
+        
+        let tableHead = [];
+        let tableRows = [];
+        let columnStyles = {};
+        
+        let sumCsaTonase = 0;
+        let sumCsaTotal = 0;
+        let sumAgrinasTonase = 0;
+        let sumAgrinasTotal = 0;
+        let sumBrondolTonase = 0;
+        let sumBrondolTotal = 0;
+        let grandTotalTonase = 0;
+        let grandTotalPendapatan = 0;
+
+        if (exportType === 'hari') {
+            tableHead = [
+                [
+                    { content: 'No', rowSpan: 2, styles: { halign: 'center', valign: 'middle' } },
+                    { content: 'Tanggal', rowSpan: 2, styles: { halign: 'center', valign: 'middle' } },
+                    { content: 'Tonase (Kg)', colSpan: 3, styles: { halign: 'center', valign: 'middle' } },
+                    { content: 'Total Tonase (Kg)', rowSpan: 2, styles: { halign: 'center', valign: 'middle' } },
+                    { content: 'Total Pendapatan (Rp)', rowSpan: 2, styles: { halign: 'center', valign: 'middle' } }
+                ],
+                [
+                    { content: 'Inti CSA', styles: { halign: 'center' } },
+                    { content: 'Agrinas', styles: { halign: 'center' } },
+                    { content: 'Brondol', styles: { halign: 'center' } }
+                ]
+            ];
+
+            columnStyles = {
+                0: { halign: 'center', cellWidth: 10 },
+                1: { halign: 'center', cellWidth: 26 },
+                2: { halign: 'right', cellWidth: 26 },
+                3: { halign: 'right', cellWidth: 26 },
+                4: { halign: 'right', cellWidth: 26 },
+                5: { halign: 'right', cellWidth: 30, fontStyle: 'bold' },
+                6: { halign: 'right', cellWidth: 38, fontStyle: 'bold' }
+            };
+
+            const dateMap = {};
+            sourceData.forEach(item => {
+                const tgl = item.tanggal;
+                if (!dateMap[tgl]) {
+                    dateMap[tgl] = {
+                        tanggal: tgl,
+                        csaTonase: 0, csaTotal: 0,
+                        agrinasTonase: 0, agrinasTotal: 0,
+                        brondolTonase: 0, brondolTotal: 0,
+                        totalTonase: 0, totalPendapatan: 0
+                    };
+                }
+                const kat = (item.kategori || '').toLowerCase();
+                const tns = parseFloat(String(item.tonase).replace(/[^0-9.-]/g, '')) || 0;
+                const tot = parseFloat(String(item.total).replace(/[^0-9.-]/g, '')) || 0;
+
+                if (kat.includes('csa')) {
+                    dateMap[tgl].csaTonase += tns;
+                    dateMap[tgl].csaTotal += tot;
+                    sumCsaTonase += tns;
+                    sumCsaTotal += tot;
+                } else if (kat.includes('agrinas')) {
+                    dateMap[tgl].agrinasTonase += tns;
+                    dateMap[tgl].agrinasTotal += tot;
+                    sumAgrinasTonase += tns;
+                    sumAgrinasTotal += tot;
+                } else if (kat.includes('brondol')) {
+                    dateMap[tgl].brondolTonase += tns;
+                    dateMap[tgl].brondolTotal += tot;
+                    sumBrondolTonase += tns;
+                    sumBrondolTotal += tot;
+                }
+                dateMap[tgl].totalTonase += tns;
+                dateMap[tgl].totalPendapatan += tot;
+                grandTotalTonase += tns;
+                grandTotalPendapatan += tot;
+            });
+
+            const sortedDates = Object.keys(dateMap).sort();
+            sortedDates.forEach((tgl, idx) => {
+                const row = dateMap[tgl];
+                tableRows.push([
+                    idx + 1,
+                    row.tanggal,
+                    row.csaTonase > 0 ? new Intl.NumberFormat('id-ID').format(row.csaTonase) : '-',
+                    row.agrinasTonase > 0 ? new Intl.NumberFormat('id-ID').format(row.agrinasTonase) : '-',
+                    row.brondolTonase > 0 ? new Intl.NumberFormat('id-ID').format(row.brondolTonase) : '-',
+                    new Intl.NumberFormat('id-ID').format(row.totalTonase),
+                    new Intl.NumberFormat('id-ID').format(row.totalPendapatan)
+                ]);
+            });
+
+            tableRows.push([
+                { content: 'TOTAL', colSpan: 2, styles: { fontStyle: 'bold', halign: 'right' } },
+                { content: new Intl.NumberFormat('id-ID').format(sumCsaTonase), styles: { fontStyle: 'bold', halign: 'right' } },
+                { content: new Intl.NumberFormat('id-ID').format(sumAgrinasTonase), styles: { fontStyle: 'bold', halign: 'right' } },
+                { content: new Intl.NumberFormat('id-ID').format(sumBrondolTonase), styles: { fontStyle: 'bold', halign: 'right' } },
+                { content: new Intl.NumberFormat('id-ID').format(grandTotalTonase), styles: { fontStyle: 'bold', halign: 'right' } },
+                { content: new Intl.NumberFormat('id-ID').format(grandTotalPendapatan), styles: { fontStyle: 'bold', halign: 'right' } }
+            ]);
+        } else if (exportType === 'minggu') {
+            tableHead = [
+                [
+                    { content: 'No', rowSpan: 2, styles: { halign: 'center', valign: 'middle' } },
+                    { content: 'Tanggal', rowSpan: 2, styles: { halign: 'center', valign: 'middle' } },
+                    { content: 'Minggu Ke', rowSpan: 2, styles: { halign: 'center', valign: 'middle' } },
+                    { content: 'Tonase (Kg)', colSpan: 3, styles: { halign: 'center', valign: 'middle' } },
+                    { content: 'Total Tonase (Kg)', rowSpan: 2, styles: { halign: 'center', valign: 'middle' } },
+                    { content: 'Total Pendapatan (Rp)', rowSpan: 2, styles: { halign: 'center', valign: 'middle' } }
+                ],
+                [
+                    { content: 'Inti CSA', styles: { halign: 'center' } },
+                    { content: 'Agrinas', styles: { halign: 'center' } },
+                    { content: 'Brondol', styles: { halign: 'center' } }
+                ]
+            ];
+
+            columnStyles = {
+                0: { halign: 'center', cellWidth: 8 },
+                1: { halign: 'center', cellWidth: 26 },
+                2: { halign: 'center', cellWidth: 20 },
+                3: { halign: 'right', cellWidth: 24 },
+                4: { halign: 'right', cellWidth: 24 },
+                5: { halign: 'right', cellWidth: 24 },
+                6: { halign: 'right', cellWidth: 26, fontStyle: 'bold' },
+                7: { halign: 'right', cellWidth: 29, fontStyle: 'bold' }
+            };
+
+            const weeklyData = {};
+            sourceData.forEach(item => {
+                const kat = (item.kategori || '').toLowerCase();
+                const tns = parseFloat(String(item.tonase).replace(/[^0-9.-]/g, '')) || 0;
+                const tot = parseFloat(String(item.total).replace(/[^0-9.-]/g, '')) || 0;
+                const dateObj = new Date(item.tanggal);
+                const day = dateObj.getDate();
+                const week = Math.ceil(day / 7);
+
+                if (!weeklyData[week]) {
+                    const itemMonth = monthNames[dateObj.getMonth()];
+                    let dateRange = "";
+                    if (week === 1) dateRange = `1 - 7 ${itemMonth}`;
+                    else if (week === 2) dateRange = `8 - 14 ${itemMonth}`;
+                    else if (week === 3) dateRange = `15 - 21 ${itemMonth}`;
+                    else if (week === 4) dateRange = `22 - 28 ${itemMonth}`;
+                    else if (week === 5) {
+                        const lastDay = new Date(dateObj.getFullYear(), dateObj.getMonth() + 1, 0).getDate();
+                        dateRange = `29 - ${lastDay} ${itemMonth}`;
+                    }
+                    weeklyData[week] = {
+                        dateRange,
+                        csaTonase: 0, csaTotal: 0,
+                        agrinasTonase: 0, agrinasTotal: 0,
+                        brondolTonase: 0, brondolTotal: 0,
+                        totalTonase: 0, totalPendapatan: 0
+                    };
+                }
+
+                if (kat.includes('csa')) {
+                    weeklyData[week].csaTonase += tns;
+                    weeklyData[week].csaTotal += tot;
+                    sumCsaTonase += tns;
+                    sumCsaTotal += tot;
+                } else if (kat.includes('agrinas')) {
+                    weeklyData[week].agrinasTonase += tns;
+                    weeklyData[week].agrinasTotal += tot;
+                    sumAgrinasTonase += tns;
+                    sumAgrinasTotal += tot;
+                } else if (kat.includes('brondol')) {
+                    weeklyData[week].brondolTonase += tns;
+                    weeklyData[week].brondolTotal += tot;
+                    sumBrondolTonase += tns;
+                    sumBrondolTotal += tot;
+                }
+                weeklyData[week].totalTonase += tns;
+                weeklyData[week].totalPendapatan += tot;
+                grandTotalTonase += tns;
+                grandTotalPendapatan += tot;
+            });
+
+            let idx = 1;
+            for (const [week, data] of Object.entries(weeklyData).sort((a,b) => a[0] - b[0])) {
+                tableRows.push([
+                    idx++,
+                    data.dateRange,
+                    `Minggu ${week}`,
+                    data.csaTonase > 0 ? new Intl.NumberFormat('id-ID').format(data.csaTonase) : '-',
+                    data.agrinasTonase > 0 ? new Intl.NumberFormat('id-ID').format(data.agrinasTonase) : '-',
+                    data.brondolTonase > 0 ? new Intl.NumberFormat('id-ID').format(data.brondolTonase) : '-',
+                    new Intl.NumberFormat('id-ID').format(data.totalTonase),
+                    new Intl.NumberFormat('id-ID').format(data.totalPendapatan)
+                ]);
+            }
+
+            tableRows.push([
+                { content: 'TOTAL', colSpan: 3, styles: { fontStyle: 'bold', halign: 'right' } },
+                { content: new Intl.NumberFormat('id-ID').format(sumCsaTonase), styles: { fontStyle: 'bold', halign: 'right' } },
+                { content: new Intl.NumberFormat('id-ID').format(sumAgrinasTonase), styles: { fontStyle: 'bold', halign: 'right' } },
+                { content: new Intl.NumberFormat('id-ID').format(sumBrondolTonase), styles: { fontStyle: 'bold', halign: 'right' } },
+                { content: new Intl.NumberFormat('id-ID').format(grandTotalTonase), styles: { fontStyle: 'bold', halign: 'right' } },
+                { content: new Intl.NumberFormat('id-ID').format(grandTotalPendapatan), styles: { fontStyle: 'bold', halign: 'right' } }
+            ]);
+        } else if (exportType === 'bulan') {
+            tableHead = [
+                [
+                    { content: 'No', rowSpan: 2, styles: { halign: 'center', valign: 'middle' } },
+                    { content: 'Bulan', rowSpan: 2, styles: { halign: 'center', valign: 'middle' } },
+                    { content: 'Tonase (Kg)', colSpan: 3, styles: { halign: 'center', valign: 'middle' } },
+                    { content: 'Total Tonase (Kg)', rowSpan: 2, styles: { halign: 'center', valign: 'middle' } },
+                    { content: 'Total Pendapatan (Rp)', rowSpan: 2, styles: { halign: 'center', valign: 'middle' } }
+                ],
+                [
+                    { content: 'Inti CSA', styles: { halign: 'center' } },
+                    { content: 'Agrinas', styles: { halign: 'center' } },
+                    { content: 'Brondol', styles: { halign: 'center' } }
+                ]
+            ];
+
+            columnStyles = {
+                0: { halign: 'center', cellWidth: 10 },
+                1: { halign: 'center', cellWidth: 32 },
+                2: { halign: 'right', cellWidth: 26 },
+                3: { halign: 'right', cellWidth: 26 },
+                4: { halign: 'right', cellWidth: 26 },
+                5: { halign: 'right', cellWidth: 30, fontStyle: 'bold' },
+                6: { halign: 'right', cellWidth: 32, fontStyle: 'bold' }
+            };
+
+            const monthlyData = {};
+            sourceData.forEach(item => {
+                const kat = (item.kategori || '').toLowerCase();
+                const tns = parseFloat(String(item.tonase).replace(/[^0-9.-]/g, '')) || 0;
+                const tot = parseFloat(String(item.total).replace(/[^0-9.-]/g, '')) || 0;
+                const dateObj = new Date(item.tanggal);
+                const m = dateObj.getMonth();
+                const y = dateObj.getFullYear();
+                const key = `${monthNames[m]} ${y}`;
+
+                if (!monthlyData[key]) {
+                    monthlyData[key] = {
+                        monthIndex: y * 12 + m,
+                        csaTonase: 0, csaTotal: 0,
+                        agrinasTonase: 0, agrinasTotal: 0,
+                        brondolTonase: 0, brondolTotal: 0,
+                        totalTonase: 0, totalPendapatan: 0
+                    };
+                }
+
+                if (kat.includes('csa')) {
+                    monthlyData[key].csaTonase += tns;
+                    monthlyData[key].csaTotal += tot;
+                    sumCsaTonase += tns;
+                    sumCsaTotal += tot;
+                } else if (kat.includes('agrinas')) {
+                    monthlyData[key].agrinasTonase += tns;
+                    monthlyData[key].agrinasTotal += tot;
+                    sumAgrinasTonase += tns;
+                    sumAgrinasTotal += tot;
+                } else if (kat.includes('brondol')) {
+                    monthlyData[key].brondolTonase += tns;
+                    monthlyData[key].brondolTotal += tot;
+                    sumBrondolTonase += tns;
+                    sumBrondolTotal += tot;
+                }
+                monthlyData[key].totalTonase += tns;
+                monthlyData[key].totalPendapatan += tot;
+                grandTotalTonase += tns;
+                grandTotalPendapatan += tot;
+            });
+
+            let idx = 1;
+            for (const [monthKey, data] of Object.entries(monthlyData).sort((a,b) => a[1].monthIndex - b[1].monthIndex)) {
+                tableRows.push([
+                    idx++,
+                    monthKey,
+                    data.csaTonase > 0 ? new Intl.NumberFormat('id-ID').format(data.csaTonase) : '-',
+                    data.agrinasTonase > 0 ? new Intl.NumberFormat('id-ID').format(data.agrinasTonase) : '-',
+                    data.brondolTonase > 0 ? new Intl.NumberFormat('id-ID').format(data.brondolTonase) : '-',
+                    new Intl.NumberFormat('id-ID').format(data.totalTonase),
+                    new Intl.NumberFormat('id-ID').format(data.totalPendapatan)
+                ]);
+            }
+
+            tableRows.push([
+                { content: 'TOTAL', colSpan: 2, styles: { fontStyle: 'bold', halign: 'right' } },
+                { content: new Intl.NumberFormat('id-ID').format(sumCsaTonase), styles: { fontStyle: 'bold', halign: 'right' } },
+                { content: new Intl.NumberFormat('id-ID').format(sumAgrinasTonase), styles: { fontStyle: 'bold', halign: 'right' } },
+                { content: new Intl.NumberFormat('id-ID').format(sumBrondolTonase), styles: { fontStyle: 'bold', halign: 'right' } },
+                { content: new Intl.NumberFormat('id-ID').format(grandTotalTonase), styles: { fontStyle: 'bold', halign: 'right' } },
+                { content: new Intl.NumberFormat('id-ID').format(grandTotalPendapatan), styles: { fontStyle: 'bold', halign: 'right' } }
+            ]);
+        }
+
+        autoTable(doc, {
+            head: tableHead,
+            body: tableRows,
+            startY: 65,
+            margin: { top: 60, bottom: 35, left: 14, right: 14 },
+            theme: 'grid',
+            willDrawPage: function (data) {
+                if (data.pageNumber > 1) {
+                    doc.addImage(kopSuratBase64, 'PNG', 0, 0, 210, 297);
+                }
+            },
+            styles: {
+                lineWidth: 0.3,
+                lineColor: [0, 0, 0],
+                fontSize: 8,
+                cellPadding: 2
+            },
+            headStyles: { 
+                fillColor: [255, 255, 255], 
+                textColor: [0, 0, 0], 
+                fontStyle: 'bold',
+                halign: 'center',
+                valign: 'middle'
+            },
+            bodyStyles: {
+                textColor: [0, 0, 0],
+            },
+            columnStyles: columnStyles
+        });
+
+        // Kotak Ringkasan Finansial & Kontribusi Tonase
+        const finalY = doc.lastAutoTable ? doc.lastAutoTable.finalY + 8 : 200;
+        if (finalY < 235) {
+            autoTable(doc, {
+                startY: finalY,
+                margin: { left: 14, right: 14 },
+                head: [['Rincian Kategori', 'Total Tonase (Kg)', 'Total Pendapatan (Rp)', 'Kontribusi Tonase (%)']],
+                body: [
+                    ['Inti CSA', new Intl.NumberFormat('id-ID').format(sumCsaTonase), 'Rp ' + new Intl.NumberFormat('id-ID').format(sumCsaTotal), grandTotalTonase > 0 ? (sumCsaTonase / grandTotalTonase * 100).toFixed(1) + '%' : '0%'],
+                    ['Agrinas', new Intl.NumberFormat('id-ID').format(sumAgrinasTonase), 'Rp ' + new Intl.NumberFormat('id-ID').format(sumAgrinasTotal), grandTotalTonase > 0 ? (sumAgrinasTonase / grandTotalTonase * 100).toFixed(1) + '%' : '0%'],
+                    ['Brondol', new Intl.NumberFormat('id-ID').format(sumBrondolTonase), 'Rp ' + new Intl.NumberFormat('id-ID').format(sumBrondolTotal), grandTotalTonase > 0 ? (sumBrondolTonase / grandTotalTonase * 100).toFixed(1) + '%' : '0%'],
+                    [
+                        { content: 'TOTAL KESELURUHAN (GLOBAL)', styles: { fontStyle: 'bold' } },
+                        { content: new Intl.NumberFormat('id-ID').format(grandTotalTonase) + ' Kg', styles: { fontStyle: 'bold', halign: 'right' } },
+                        { content: 'Rp ' + new Intl.NumberFormat('id-ID').format(grandTotalPendapatan), styles: { fontStyle: 'bold', halign: 'right' } },
+                        { content: '100%', styles: { fontStyle: 'bold', halign: 'center' } }
+                    ]
+                ],
+                theme: 'grid',
+                styles: { 
+                    fontSize: 8, 
+                    cellPadding: 2, 
+                    lineWidth: 0.3, 
+                    lineColor: [0, 0, 0],
+                    textColor: [0, 0, 0]
+                },
+                headStyles: { 
+                    fillColor: [255, 255, 255], 
+                    textColor: [0, 0, 0], 
+                    fontStyle: 'bold', 
+                    halign: 'center' 
+                },
+                bodyStyles: {
+                    textColor: [0, 0, 0],
+                },
+                columnStyles: {
+                    0: { halign: 'left', cellWidth: 50 },
+                    1: { halign: 'right', cellWidth: 42 },
+                    2: { halign: 'right', cellWidth: 55 },
+                    3: { halign: 'center', cellWidth: 35 }
+                }
+            });
+        }
+        
+        const fileNamePdf = `Laporan_Global_${exportType.charAt(0).toUpperCase() + exportType.slice(1)}_${currentBulan}_${currentTahun}.pdf`;
+        doc.save(fileNamePdf);
+
+        // Catat Audit Log Ekspor PDF Global
+        router.post('/audit-log/export', {
+            module: 'Laporan Produksi',
+            file_type: 'PDF',
+            description: `Mengunduh file PDF Laporan Produksi Global (Gabungan CSA, Agrinas, Brondol) - Periode: ${namaBulan} ${currentTahun} ${namaMinggu} (${exportType})`.trim()
+        }, { preserveScroll: true, preserveState: true });
+    };
+
     const exportPDF = async () => {
+        if (currentKategori === 'Global') {
+            await exportGlobalPDF();
+            return;
+        }
+
         const { jsPDF } = await import('jspdf');
         const autoTable = (await import('jspdf-autotable')).default;
         const { kopSuratBase64 } = await import('@/utils/kopSuratBase64');
@@ -486,7 +992,6 @@ export default function Laporan({ auth, data, filters = {}, isLocked = false }) 
                 { content: new Intl.NumberFormat('id-ID').format(totalPendapatanPdf), styles: { fontStyle: 'bold', halign: 'right' } }
             ]);
         } else if (exportType === 'minggu') {
-            // Sesuai permintaan: No, Tanggal, Minggu Ke, Tonase
             tableColumn = ["No", "Tanggal", "Minggu Ke", "Tonase (Kg)", "Total Pendapatan (Rp)"];
             columnStyles = { 0: { halign: 'center' }, 2: { halign: 'center' }, 3: { halign: 'center' }, 4: { halign: 'right' } };
             
@@ -575,7 +1080,6 @@ export default function Laporan({ auth, data, filters = {}, isLocked = false }) 
             margin: { top: 60, bottom: 35, left: 14, right: 14 },
             theme: 'grid',
             willDrawPage: function (data) {
-                // Tambahkan kop surat sebagai background di setiap halaman tambahan jika diperlukan
                 if (data.pageNumber > 1) {
                     doc.addImage(kopSuratBase64, 'PNG', 0, 0, 210, 297);
                 }
@@ -596,7 +1100,7 @@ export default function Laporan({ auth, data, filters = {}, isLocked = false }) 
             columnStyles: columnStyles
         });
         
-        const fileNamePdf = `Laporan_${exportType.charAt(0).toUpperCase() + exportType.slice(1)}_${currentBulan}_${currentTahun}.pdf`;
+        const fileNamePdf = `Laporan_${exportType.charAt(0).toUpperCase() + exportType.slice(1)}_${currentKategori.replace(/\s+/g, '_')}_${currentBulan}_${currentTahun}.pdf`;
         doc.save(fileNamePdf);
 
         // Catat Audit Log Ekspor PDF
@@ -614,69 +1118,152 @@ export default function Laporan({ auth, data, filters = {}, isLocked = false }) 
         const namaMinggu = currentMinggu === 'all' ? "" : `(Minggu ${currentMinggu})`;
 
         let excelRows = [];
-        if (exportType === 'hari') {
-            excelRows = listData.map((item, index) => ({
-                'No': index + 1,
-                'Tanggal': item.tanggal,
-                'Harga/Kg (Rp)': parseFloat(String(item.harga_per_kg).replace(/[^0-9.-]/g, '')) || 0,
-                'Tonase (Kg)': parseFloat(String(item.tonase).replace(/[^0-9.-]/g, '')) || 0,
-                'Total (Rp)': parseFloat(String(item.total).replace(/[^0-9.-]/g, '')) || 0
-            }));
-        } else if (exportType === 'minggu') {
-            const weeklyData = {};
-            listData.forEach(item => {
-                const tonaseVal = parseFloat(String(item.tonase).replace(/[^0-9.-]/g, '')) || 0;
-                const totalVal = parseFloat(String(item.total).replace(/[^0-9.-]/g, '')) || 0;
-                const dateObj = new Date(item.tanggal);
-                const day = dateObj.getDate();
-                const week = Math.ceil(day / 7);
-                if (!weeklyData[week]) {
-                    weeklyData[week] = { tonase: 0, total: 0, minDate: item.tanggal, maxDate: item.tanggal };
-                }
-                weeklyData[week].tonase += tonaseVal;
-                weeklyData[week].total += totalVal;
-                if (item.tanggal < weeklyData[week].minDate) weeklyData[week].minDate = item.tanggal;
-                if (item.tanggal > weeklyData[week].maxDate) weeklyData[week].maxDate = item.tanggal;
-            });
 
-            let idx = 1;
-            for (const [weekNum, data] of Object.entries(weeklyData)) {
-                excelRows.push({
-                    'No': idx++,
-                    'Tanggal': `${data.minDate} s/d ${data.maxDate}`,
-                    'Minggu Ke': `Minggu ${weekNum}`,
-                    'Tonase (Kg)': data.tonase,
-                    'Total Pendapatan (Rp)': data.total
+        if (currentKategori === 'Global') {
+            if (exportType === 'hari') {
+                excelRows = globalAggregatedData.map((row, index) => ({
+                    'No': index + 1,
+                    'Tanggal': row.tanggal,
+                    'Tonase CSA (Kg)': row.tonaseCSA,
+                    'Tonase Agrinas (Kg)': row.tonaseAgrinas,
+                    'Tonase Brondol (Kg)': row.tonaseBrondol,
+                    'Total Tonase (Kg)': row.tonase,
+                    'Total Pendapatan (Rp)': row.total
+                }));
+            } else if (exportType === 'minggu') {
+                const weeklyData = {};
+                globalAggregatedData.forEach(item => {
+                    const dateObj = new Date(item.tanggal);
+                    const day = dateObj.getDate();
+                    const week = Math.ceil(day / 7);
+                    if (!weeklyData[week]) {
+                        const itemMonth = monthNames[dateObj.getMonth()];
+                        let dateRange = "";
+                        if (week === 1) dateRange = `1 - 7 ${itemMonth}`;
+                        else if (week === 2) dateRange = `8 - 14 ${itemMonth}`;
+                        else if (week === 3) dateRange = `15 - 21 ${itemMonth}`;
+                        else if (week === 4) dateRange = `22 - 28 ${itemMonth}`;
+                        else if (week === 5) {
+                            const lastDay = new Date(dateObj.getFullYear(), dateObj.getMonth() + 1, 0).getDate();
+                            dateRange = `29 - ${lastDay} ${itemMonth}`;
+                        }
+                        weeklyData[week] = { dateRange, csaTonase: 0, agrinasTonase: 0, brondolTonase: 0, totalTonase: 0, totalPendapatan: 0 };
+                    }
+                    weeklyData[week].csaTonase += item.tonaseCSA;
+                    weeklyData[week].agrinasTonase += item.tonaseAgrinas;
+                    weeklyData[week].brondolTonase += item.tonaseBrondol;
+                    weeklyData[week].totalTonase += item.tonase;
+                    weeklyData[week].totalPendapatan += item.total;
                 });
+
+                let idx = 1;
+                for (const [weekNum, data] of Object.entries(weeklyData).sort((a,b) => a[0] - b[0])) {
+                    excelRows.push({
+                        'No': idx++,
+                        'Tanggal': data.dateRange,
+                        'Minggu Ke': `Minggu ${weekNum}`,
+                        'Tonase CSA (Kg)': data.csaTonase,
+                        'Tonase Agrinas (Kg)': data.agrinasTonase,
+                        'Tonase Brondol (Kg)': data.brondolTonase,
+                        'Total Tonase (Kg)': data.totalTonase,
+                        'Total Pendapatan (Rp)': data.totalPendapatan
+                    });
+                }
+            } else {
+                const monthlyData = {};
+                globalAggregatedData.forEach(item => {
+                    const dateObj = new Date(item.tanggal);
+                    const m = dateObj.getMonth();
+                    const y = dateObj.getFullYear();
+                    const key = `${monthNames[m]} ${y}`;
+                    if (!monthlyData[key]) {
+                        monthlyData[key] = { monthIndex: y * 12 + m, csaTonase: 0, agrinasTonase: 0, brondolTonase: 0, totalTonase: 0, totalPendapatan: 0 };
+                    }
+                    monthlyData[key].csaTonase += item.tonaseCSA;
+                    monthlyData[key].agrinasTonase += item.tonaseAgrinas;
+                    monthlyData[key].brondolTonase += item.tonaseBrondol;
+                    monthlyData[key].totalTonase += item.tonase;
+                    monthlyData[key].totalPendapatan += item.total;
+                });
+
+                let idx = 1;
+                for (const [monthKey, data] of Object.entries(monthlyData).sort((a,b) => a[1].monthIndex - b[1].monthIndex)) {
+                    excelRows.push({
+                        'No': idx++,
+                        'Bulan': monthKey,
+                        'Tonase CSA (Kg)': data.csaTonase,
+                        'Tonase Agrinas (Kg)': data.agrinasTonase,
+                        'Tonase Brondol (Kg)': data.brondolTonase,
+                        'Total Tonase (Kg)': data.totalTonase,
+                        'Total Pendapatan (Rp)': data.totalPendapatan
+                    });
+                }
             }
         } else {
-            const monthlyData = {};
-            listData.forEach(item => {
-                const tonaseVal = parseFloat(String(item.tonase).replace(/[^0-9.-]/g, '')) || 0;
-                const totalVal = parseFloat(String(item.total).replace(/[^0-9.-]/g, '')) || 0;
-                const dateObj = new Date(item.tanggal);
-                const m = dateObj.getMonth();
-                const y = dateObj.getFullYear();
-                const key = `${monthNames[m]} ${y}`;
-                if (!monthlyData[key]) {
-                    monthlyData[key] = { tonase: 0, total: 0, count: 0, sumHarga: 0 };
-                }
-                monthlyData[key].tonase += tonaseVal;
-                monthlyData[key].total += totalVal;
-                monthlyData[key].sumHarga += (parseFloat(String(item.harga_per_kg).replace(/[^0-9.-]/g, '')) || 0);
-                monthlyData[key].count += 1;
-            });
-
-            let idx = 1;
-            for (const [monthKey, data] of Object.entries(monthlyData)) {
-                const avgHarga = data.count > 0 ? (data.sumHarga / data.count) : 0;
-                excelRows.push({
-                    'No': idx++,
-                    'Bulan': monthKey,
-                    'Rata-rata Harga/Kg (Rp)': Math.round(avgHarga),
-                    'Total Tonase (Kg)': data.tonase,
-                    'Total Pendapatan (Rp)': data.total
+            if (exportType === 'hari') {
+                excelRows = listData.map((item, index) => ({
+                    'No': index + 1,
+                    'Tanggal': item.tanggal,
+                    'Harga/Kg (Rp)': parseFloat(String(item.harga_per_kg).replace(/[^0-9.-]/g, '')) || 0,
+                    'Tonase (Kg)': parseFloat(String(item.tonase).replace(/[^0-9.-]/g, '')) || 0,
+                    'Total (Rp)': parseFloat(String(item.total).replace(/[^0-9.-]/g, '')) || 0
+                }));
+            } else if (exportType === 'minggu') {
+                const weeklyData = {};
+                listData.forEach(item => {
+                    const tonaseVal = parseFloat(String(item.tonase).replace(/[^0-9.-]/g, '')) || 0;
+                    const totalVal = parseFloat(String(item.total).replace(/[^0-9.-]/g, '')) || 0;
+                    const dateObj = new Date(item.tanggal);
+                    const day = dateObj.getDate();
+                    const week = Math.ceil(day / 7);
+                    if (!weeklyData[week]) {
+                        weeklyData[week] = { tonase: 0, total: 0, minDate: item.tanggal, maxDate: item.tanggal };
+                    }
+                    weeklyData[week].tonase += tonaseVal;
+                    weeklyData[week].total += totalVal;
+                    if (item.tanggal < weeklyData[week].minDate) weeklyData[week].minDate = item.tanggal;
+                    if (item.tanggal > weeklyData[week].maxDate) weeklyData[week].maxDate = item.tanggal;
                 });
+
+                let idx = 1;
+                for (const [weekNum, data] of Object.entries(weeklyData)) {
+                    excelRows.push({
+                        'No': idx++,
+                        'Tanggal': `${data.minDate} s/d ${data.maxDate}`,
+                        'Minggu Ke': `Minggu ${weekNum}`,
+                        'Tonase (Kg)': data.tonase,
+                        'Total Pendapatan (Rp)': data.total
+                    });
+                }
+            } else {
+                const monthlyData = {};
+                listData.forEach(item => {
+                    const tonaseVal = parseFloat(String(item.tonase).replace(/[^0-9.-]/g, '')) || 0;
+                    const totalVal = parseFloat(String(item.total).replace(/[^0-9.-]/g, '')) || 0;
+                    const dateObj = new Date(item.tanggal);
+                    const m = dateObj.getMonth();
+                    const y = dateObj.getFullYear();
+                    const key = `${monthNames[m]} ${y}`;
+                    if (!monthlyData[key]) {
+                        monthlyData[key] = { tonase: 0, total: 0, count: 0, sumHarga: 0 };
+                    }
+                    monthlyData[key].tonase += tonaseVal;
+                    monthlyData[key].total += totalVal;
+                    monthlyData[key].sumHarga += (parseFloat(String(item.harga_per_kg).replace(/[^0-9.-]/g, '')) || 0);
+                    monthlyData[key].count += 1;
+                });
+
+                let idx = 1;
+                for (const [monthKey, data] of Object.entries(monthlyData)) {
+                    const avgHarga = data.count > 0 ? (data.sumHarga / data.count) : 0;
+                    excelRows.push({
+                        'No': idx++,
+                        'Bulan': monthKey,
+                        'Rata-rata Harga/Kg (Rp)': Math.round(avgHarga),
+                        'Total Tonase (Kg)': data.tonase,
+                        'Total Pendapatan (Rp)': data.total
+                    });
+                }
             }
         }
 
@@ -712,7 +1299,7 @@ export default function Laporan({ auth, data, filters = {}, isLocked = false }) 
                         <div className="w-full h-[350px]">
                             <ResponsiveContainer width="100%" height="100%">
                                 <AreaChart
-                                    data={listData}
+                                    data={currentKategori === 'Global' ? globalAggregatedData : listData}
                                     margin={{ top: 10, right: 10, left: 0, bottom: 0 }}
                                 >
                                     <defs>
@@ -738,7 +1325,7 @@ export default function Laporan({ auth, data, filters = {}, isLocked = false }) 
                                     />
                                     <Tooltip 
                                         contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1)' }}
-                                        formatter={(value) => [new Intl.NumberFormat('id-ID').format(value) + ' Kg', 'Berat']}
+                                        formatter={(value, name) => [new Intl.NumberFormat('id-ID').format(value) + ' Kg', name === 'tonase' ? (currentKategori === 'Global' ? 'Total Tonase' : 'Berat') : name]}
                                         labelStyle={{ fontWeight: 'bold', color: '#1f2937', marginBottom: '4px' }}
                                     />
                                     <Area 
@@ -761,13 +1348,13 @@ export default function Laporan({ auth, data, filters = {}, isLocked = false }) 
                         {/* Tabs Kategori */}
                         <div className="border-b border-gray-200">
                             <nav className="flex -mb-px px-6" aria-label="Tabs">
-                                {['Inti CSA', 'Agrinas', 'Brondol'].map((tab) => (
+                                {['Global', 'Inti CSA', 'Agrinas', 'Brondol'].map((tab) => (
                                     <button
                                         key={tab}
                                         onClick={() => handleFilterChange('kategori', tab)}
                                         className={`whitespace-nowrap py-4 px-6 border-b-2 font-medium text-sm transition-colors duration-200 ${
                                             currentKategori === tab
-                                                ? 'border-emerald-500 text-emerald-700'
+                                                ? 'border-emerald-500 text-emerald-700 font-bold'
                                                 : 'border-transparent text-gray-600 hover:text-gray-900 hover:border-gray-300'
                                         }`}
                                     >
@@ -778,8 +1365,14 @@ export default function Laporan({ auth, data, filters = {}, isLocked = false }) 
                         </div>
                         <div className="flex flex-col xl:flex-row justify-between items-start xl:items-center gap-4 xl:gap-0 px-6 py-5 border-b border-gray-100 bg-white mb-0">
                             <div>
-                                <h1 className="text-2xl font-extrabold text-gray-900 tracking-tight">Data Laporan Produksi</h1>
-                                <p className="mt-1 text-sm text-gray-600">Rekapitulasi nilai dan tonase harian.</p>
+                                <h1 className="text-2xl font-extrabold text-gray-900 tracking-tight">
+                                    {currentKategori === 'Global' ? 'Data Laporan Produksi Global' : 'Data Laporan Produksi'}
+                                </h1>
+                                <p className="mt-1 text-sm text-gray-600">
+                                    {currentKategori === 'Global' 
+                                        ? 'Rekapitulasi gabungan dari Inti CSA, Agrinas, dan Brondol.' 
+                                        : 'Rekapitulasi nilai dan tonase harian.'}
+                                </p>
                             </div>
                             
                             <div className="flex flex-col xl:flex-row gap-3 xl:gap-2 w-full xl:w-auto xl:items-center">
@@ -851,7 +1444,7 @@ export default function Laporan({ auth, data, filters = {}, isLocked = false }) 
 
                                 {/* Buttons */}
                                 <div className="flex flex-col sm:flex-row sm:justify-end xl:items-center gap-3 xl:gap-2 w-full xl:w-auto">
-                                    {currentBulan !== 'all' && (
+                                    {currentKategori !== 'Global' && currentBulan !== 'all' && (
                                         <button onClick={handleToggleLock} className={`w-full sm:w-auto justify-center xl:justify-start inline-flex items-center px-4 py-2.5 border rounded-xl font-bold text-xs uppercase tracking-wider shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 transition-all duration-200 ${isLocked ? 'bg-red-50 border-red-200 text-red-700 hover:bg-red-100 focus:ring-red-500' : 'bg-white border-gray-300 text-gray-700 hover:bg-gray-50 focus:ring-emerald-500'}`}>
                                             {isLocked ? (
                                                 <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path></svg>
@@ -862,11 +1455,15 @@ export default function Laporan({ auth, data, filters = {}, isLocked = false }) 
                                         </button>
                                     )}
 
-                                    <input type="file" accept=".xlsx, .xls" ref={fileInputRef} onChange={handleFileUpload} className="hidden" disabled={isLocked} />
-                                    <button onClick={() => fileInputRef.current?.click()} disabled={isLocked} className={`w-full sm:w-auto justify-center xl:justify-start inline-flex items-center px-4 py-2.5 bg-white border border-gray-300 rounded-xl font-bold text-xs text-gray-700 uppercase tracking-wider shadow-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 transition-all duration-200 ${isLocked ? 'opacity-50 cursor-not-allowed' : 'hover:bg-gray-50'}`}>
-                                        <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
-                                        Import Excel
-                                    </button>
+                                    {currentKategori !== 'Global' && (
+                                        <>
+                                            <input type="file" accept=".xlsx, .xls" ref={fileInputRef} onChange={handleFileUpload} className="hidden" disabled={isLocked} />
+                                            <button onClick={handleImportClick} disabled={isLocked} className={`w-full sm:w-auto justify-center xl:justify-start inline-flex items-center px-4 py-2.5 bg-white border border-gray-300 rounded-xl font-bold text-xs text-gray-700 uppercase tracking-wider shadow-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 transition-all duration-200 ${isLocked ? 'opacity-50 cursor-not-allowed' : 'hover:bg-gray-50'}`}>
+                                                <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
+                                                Import Excel
+                                            </button>
+                                        </>
+                                    )}
                                     
                                     <div className="flex w-full sm:w-auto items-center space-x-1 border border-gray-200 xl:border-transparent rounded-xl bg-gray-50 xl:bg-transparent overflow-hidden shadow-sm xl:shadow-none">
                                         <label htmlFor="export-type" className="sr-only">Format Periode Ekspor</label>
@@ -892,76 +1489,140 @@ export default function Laporan({ auth, data, filters = {}, isLocked = false }) 
                                         </button>
                                     </div>
                                     
-                                    <button onClick={handleOpenInputModal} disabled={isLocked} className={`w-full sm:w-auto justify-center xl:justify-start inline-flex items-center px-4 py-2.5 bg-gradient-to-r from-emerald-500 to-green-600 border border-transparent rounded-xl font-bold text-xs text-white uppercase tracking-wider shadow-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 transform transition-all duration-200 ${isLocked ? 'opacity-50 cursor-not-allowed' : 'hover:shadow-md hover:from-emerald-600 hover:to-green-700 hover:-translate-y-0.5'}`}>
-                                        <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
-                                        Input Laporan
-                                    </button>
+                                    {currentKategori !== 'Global' && (
+                                        <button onClick={handleOpenInputModal} disabled={isLocked} className={`w-full sm:w-auto justify-center xl:justify-start inline-flex items-center px-4 py-2.5 bg-gradient-to-r from-emerald-500 to-green-600 border border-transparent rounded-xl font-bold text-xs text-white uppercase tracking-wider shadow-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 transform transition-all duration-200 ${isLocked ? 'opacity-50 cursor-not-allowed' : 'hover:shadow-md hover:from-emerald-600 hover:to-green-700 hover:-translate-y-0.5'}`}>
+                                            <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
+                                            Input Laporan
+                                        </button>
+                                    )}
                                 </div>
                             </div>
                         </div>
                         <div className="overflow-x-auto w-full">
-                            <table className="w-full text-sm text-left text-gray-700">
-                                <thead className="text-xs font-semibold text-gray-700 uppercase tracking-wider border-b border-gray-200 bg-gray-50">
-                                    <tr>
-                                        <th className="px-6 py-4 w-16">No</th>
-                                        <th className="px-6 py-4">Tanggal</th>
-                                        <th className="px-6 py-4 text-center">Harga/Kg (Rp)</th>
-                                        <th className="px-6 py-4 text-center">Tonase (Kg)</th>
-                                        <th className="px-6 py-4 text-center">Total (Rp)</th>
-                                        <th className="px-6 py-4 text-center">Aksi</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {listData.length === 0 ? (
+                            {currentKategori === 'Global' ? (
+                                <table className="w-full text-sm text-left text-gray-700">
+                                    <thead className="text-xs font-semibold text-gray-700 uppercase tracking-wider border-b border-gray-200 bg-gray-50">
                                         <tr>
-                                            <td colSpan="6" className="px-6 py-12 text-center text-gray-600 font-medium">
-                                                Belum ada data laporan untuk bulan ini.
-                                            </td>
+                                            <th rowSpan="2" className="px-4 py-3 text-center border-r border-gray-200 w-12">No</th>
+                                            <th rowSpan="2" className="px-4 py-3 text-center border-r border-gray-200">Tanggal</th>
+                                            <th colSpan="3" className="px-4 py-2 text-center border-b border-r border-gray-200">Tonase (Kg)</th>
+                                            <th rowSpan="2" className="px-4 py-3 text-center border-r border-gray-200">Total Tonase (Kg)</th>
+                                            <th rowSpan="2" className="px-4 py-3 text-center">Total Pendapatan (Rp)</th>
                                         </tr>
-                                    ) : (
-                                        listData.map((item, index) => (
-                                            <tr key={index} className="hover:bg-emerald-50/30 transition-colors duration-150 border-b border-gray-100">
-                                                <td className="px-6 py-4">{index + 1}</td>
-                                                <td className="px-6 py-4 font-bold text-gray-800">{item.tanggal}</td>
-                                                <td className="px-6 py-4 text-center font-medium text-gray-900">{new Intl.NumberFormat('id-ID').format(item.harga_per_kg)}</td>
-                                                <td className="px-6 py-4 text-center font-medium text-gray-900">{new Intl.NumberFormat('id-ID').format(item.tonase)}</td>
-                                                <td className="px-6 py-4 text-center font-bold text-emerald-800">{new Intl.NumberFormat('id-ID').format(item.total)}</td>
-                                                <td className="px-6 py-4 text-center space-x-2">
-                                                    <button onClick={() => handleEditClick(item)} disabled={isLocked} className={`text-emerald-700 ${isLocked ? 'opacity-50 cursor-not-allowed' : 'hover:text-emerald-900'}`} title="Edit" aria-label={`Edit data tanggal ${item.tanggal}`}>
-                                                        <svg className="w-5 h-5 inline-block" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
-                                                    </button>
-                                                    <button onClick={() => handleDeleteClick(item.id)} disabled={isLocked} className={`text-rose-700 ${isLocked ? 'opacity-50 cursor-not-allowed' : 'hover:text-rose-900'}`} title="Hapus" aria-label={`Hapus data tanggal ${item.tanggal}`}>
-                                                        <svg className="w-5 h-5 inline-block" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
-                                                    </button>
+                                        <tr>
+                                            <th className="px-4 py-2 text-center border-r border-gray-200 text-xs">Inti CSA</th>
+                                            <th className="px-4 py-2 text-center border-r border-gray-200 text-xs">Agrinas</th>
+                                            <th className="px-4 py-2 text-center border-r border-gray-200 text-xs">Brondol</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {globalAggregatedData.length === 0 ? (
+                                            <tr>
+                                                <td colSpan="7" className="px-6 py-12 text-center text-gray-500 font-medium">
+                                                    Belum ada data laporan gabungan untuk periode ini.
                                                 </td>
                                             </tr>
-                                        ))
+                                        ) : (
+                                            globalAggregatedData.map((row, idx) => (
+                                                <tr key={idx} className="hover:bg-gray-50 transition-colors duration-150 border-b border-gray-100">
+                                                    <td className="px-4 py-3 text-center font-medium">{idx + 1}</td>
+                                                    <td className="px-4 py-3 text-center font-bold text-gray-800">{row.tanggal}</td>
+                                                    <td className="px-4 py-3 text-right font-medium">{row.tonaseCSA > 0 ? new Intl.NumberFormat('id-ID').format(row.tonaseCSA) : '-'}</td>
+                                                    <td className="px-4 py-3 text-right font-medium">{row.tonaseAgrinas > 0 ? new Intl.NumberFormat('id-ID').format(row.tonaseAgrinas) : '-'}</td>
+                                                    <td className="px-4 py-3 text-right font-medium">{row.tonaseBrondol > 0 ? new Intl.NumberFormat('id-ID').format(row.tonaseBrondol) : '-'}</td>
+                                                    <td className="px-4 py-3 text-right font-bold text-gray-900">{new Intl.NumberFormat('id-ID').format(row.tonase)}</td>
+                                                    <td className="px-4 py-3 text-right font-bold text-gray-900">{new Intl.NumberFormat('id-ID').format(row.total)}</td>
+                                                </tr>
+                                            ))
+                                        )}
+                                    </tbody>
+                                    {globalAggregatedData.length > 0 && (
+                                        <tfoot>
+                                            <tr className="bg-gray-50 border-t-2 border-gray-300 font-extrabold text-gray-900">
+                                                <td colSpan="2" className="px-4 py-3 text-right uppercase tracking-wider text-sm">TOTAL</td>
+                                                <td className="px-4 py-3 text-right text-gray-800">
+                                                    {new Intl.NumberFormat('id-ID').format(globalAggregatedData.reduce((s, r) => s + r.tonaseCSA, 0))} Kg
+                                                </td>
+                                                <td className="px-4 py-3 text-right text-gray-800">
+                                                    {new Intl.NumberFormat('id-ID').format(globalAggregatedData.reduce((s, r) => s + r.tonaseAgrinas, 0))} Kg
+                                                </td>
+                                                <td className="px-4 py-3 text-right text-gray-800">
+                                                    {new Intl.NumberFormat('id-ID').format(globalAggregatedData.reduce((s, r) => s + r.tonaseBrondol, 0))} Kg
+                                                </td>
+                                                <td className="px-4 py-3 text-right text-gray-900 text-base">
+                                                    {new Intl.NumberFormat('id-ID').format(globalAggregatedData.reduce((s, r) => s + r.tonase, 0))} Kg
+                                                </td>
+                                                <td className="px-4 py-3 text-right text-gray-900 text-base">
+                                                    Rp {new Intl.NumberFormat('id-ID').format(globalAggregatedData.reduce((s, r) => s + r.total, 0))}
+                                                </td>
+                                            </tr>
+                                        </tfoot>
                                     )}
-                                </tbody>
-                                {listData.length > 0 && (
-                                    <tfoot>
-                                        <tr className="bg-gray-50 border-t-2 border-gray-300">
-                                            <td colSpan="3" className="px-6 py-4 text-right font-bold text-gray-800 uppercase tracking-wider text-sm">Total</td>
-                                            <td className="px-6 py-4 text-center font-extrabold text-emerald-800 text-base">
-                                                {new Intl.NumberFormat('id-ID').format(
-                                                    listData.reduce((sum, item) => sum + (parseFloat(item.tonase) || 0), 0)
-                                                )} Kg
-                                            </td>
-                                            <td className="px-6 py-4 text-center">
-                                                <div className="font-extrabold text-emerald-800 text-base">
-                                                    Rp {new Intl.NumberFormat('id-ID').format(
-                                                        listData.reduce((sum, item) => sum + (parseFloat(item.total) || 0), 0)
-                                                    )}
-                                                </div>
-                                                <div className="text-xs text-gray-600 mt-1 font-normal normal-case leading-tight">
-                                                    *Akumulatif pendapatan sebelum pengurangan SPSI (upah bongkar) dll
-                                                </div>
-                                            </td>
-                                            <td className="px-6 py-4"></td>
+                                </table>
+                            ) : (
+                                <table className="w-full text-sm text-left text-gray-700">
+                                    <thead className="text-xs font-semibold text-gray-700 uppercase tracking-wider border-b border-gray-200 bg-gray-50">
+                                        <tr>
+                                            <th className="px-6 py-4 w-16">No</th>
+                                            <th className="px-6 py-4">Tanggal</th>
+                                            <th className="px-6 py-4 text-center">Harga/Kg (Rp)</th>
+                                            <th className="px-6 py-4 text-center">Tonase (Kg)</th>
+                                            <th className="px-6 py-4 text-center">Total (Rp)</th>
+                                            <th className="px-6 py-4 text-center">Aksi</th>
                                         </tr>
-                                    </tfoot>
-                                )}
-                            </table>
+                                    </thead>
+                                    <tbody>
+                                        {listData.length === 0 ? (
+                                            <tr>
+                                                <td colSpan="6" className="px-6 py-12 text-center text-gray-600 font-medium">
+                                                    Belum ada data laporan untuk bulan ini.
+                                                </td>
+                                            </tr>
+                                        ) : (
+                                            listData.map((item, index) => (
+                                                <tr key={index} className="hover:bg-emerald-50/30 transition-colors duration-150 border-b border-gray-100">
+                                                    <td className="px-6 py-4">{index + 1}</td>
+                                                    <td className="px-6 py-4 font-bold text-gray-800">{item.tanggal}</td>
+                                                    <td className="px-6 py-4 text-center font-medium text-gray-900">{new Intl.NumberFormat('id-ID').format(item.harga_per_kg)}</td>
+                                                    <td className="px-6 py-4 text-center font-medium text-gray-900">{new Intl.NumberFormat('id-ID').format(item.tonase)}</td>
+                                                    <td className="px-6 py-4 text-center font-bold text-emerald-800">{new Intl.NumberFormat('id-ID').format(item.total)}</td>
+                                                    <td className="px-6 py-4 text-center space-x-2">
+                                                        <button onClick={() => handleEditClick(item)} disabled={isLocked} className={`text-emerald-700 ${isLocked ? 'opacity-50 cursor-not-allowed' : 'hover:text-emerald-900'}`} title="Edit" aria-label={`Edit data tanggal ${item.tanggal}`}>
+                                                            <svg className="w-5 h-5 inline-block" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
+                                                        </button>
+                                                        <button onClick={() => handleDeleteClick(item.id)} disabled={isLocked} className={`text-rose-700 ${isLocked ? 'opacity-50 cursor-not-allowed' : 'hover:text-rose-900'}`} title="Hapus" aria-label={`Hapus data tanggal ${item.tanggal}`}>
+                                                            <svg className="w-5 h-5 inline-block" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                                                        </button>
+                                                    </td>
+                                                </tr>
+                                            ))
+                                        )}
+                                    </tbody>
+                                    {listData.length > 0 && (
+                                        <tfoot>
+                                            <tr className="bg-gray-50 border-t-2 border-gray-300">
+                                                <td colSpan="3" className="px-6 py-4 text-right font-bold text-gray-800 uppercase tracking-wider text-sm">Total</td>
+                                                <td className="px-6 py-4 text-center font-extrabold text-emerald-800 text-base">
+                                                    {new Intl.NumberFormat('id-ID').format(
+                                                        listData.reduce((sum, item) => sum + (parseFloat(item.tonase) || 0), 0)
+                                                    )} Kg
+                                                </td>
+                                                <td className="px-6 py-4 text-center">
+                                                    <div className="font-extrabold text-emerald-800 text-base">
+                                                        Rp {new Intl.NumberFormat('id-ID').format(
+                                                            listData.reduce((sum, item) => sum + (parseFloat(item.total) || 0), 0)
+                                                        )}
+                                                    </div>
+                                                    <div className="text-xs text-gray-600 mt-1 font-normal normal-case leading-tight">
+                                                        *Akumulatif pendapatan sebelum pengurangan SPSI (upah bongkar) dll
+                                                    </div>
+                                                </td>
+                                                <td className="px-6 py-4"></td>
+                                            </tr>
+                                        </tfoot>
+                                    )}
+                                </table>
+                            )}
                         </div>
                     </div>
                 </div>
@@ -975,7 +1636,20 @@ export default function Laporan({ auth, data, filters = {}, isLocked = false }) 
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <div>
                                 <label htmlFor="input-kategori" className="block text-sm font-medium text-gray-700">Kategori</label>
-                                <input id="input-kategori" type="text" value={formData.kategori} className="mt-1 block w-full rounded-md border-gray-300 bg-gray-50 shadow-sm sm:text-sm text-gray-700" readOnly />
+                                {currentKategori === 'Global' ? (
+                                    <select 
+                                        id="input-kategori" 
+                                        value={formData.kategori} 
+                                        onChange={e => setData('kategori', e.target.value)} 
+                                        className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-emerald-500 focus:ring-emerald-500 sm:text-sm text-gray-800 bg-white"
+                                    >
+                                        <option value="Inti CSA">Inti CSA</option>
+                                        <option value="Agrinas">Agrinas</option>
+                                        <option value="Brondol">Brondol</option>
+                                    </select>
+                                ) : (
+                                    <input id="input-kategori" type="text" value={formData.kategori} className="mt-1 block w-full rounded-md border-gray-300 bg-gray-50 shadow-sm sm:text-sm text-gray-700" readOnly />
+                                )}
                             </div>
                             <div>
                                 <label htmlFor="input-tanggal" className="block text-sm font-medium text-gray-700">Tanggal</label>

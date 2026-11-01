@@ -178,7 +178,62 @@ class LaporanProduksiController extends Controller
         $bulan = $request->query('bulan', date('n'));
         $tahun = $request->query('tahun', date('Y'));
         $minggu = $request->query('minggu', 'all');
-        $kategori = $request->query('kategori', 'Inti CSA');
+        $kategori = $request->query('kategori', 'Global');
+
+        $monthFilter = $bulan === 'all' ? "" : "MONTH(tanggal) = " . (int)$bulan . " AND";
+        
+        $weekFilter = "";
+        if ($minggu !== 'all') {
+            $m = (int)$minggu;
+            $startDay = ($m - 1) * 7 + 1;
+            $endDay = $m * 7;
+            if ($m == 5) {
+                $weekFilter = "DAY(tanggal) >= 29 AND";
+            } else {
+                $weekFilter = "DAY(tanggal) BETWEEN $startDay AND $endDay AND";
+            }
+        }
+
+        $params = [$tahun];
+        $kategoriFilter = "";
+        if ($kategori !== 'Global') {
+            $kategoriFilter = "AND kategori = ?";
+            $params[] = $kategori;
+        }
+
+        $data = DB::select("
+            SELECT 
+                id,
+                tanggal,
+                kategori,
+                harga_per_kg,
+                tonase,
+                total
+            FROM laporans
+            WHERE $monthFilter $weekFilter YEAR(tanggal) = ? $kategoriFilter
+            ORDER BY tanggal ASC, kategori ASC
+        ", $params);
+
+        $isLocked = false;
+        if ($bulan !== 'all') {
+            $lock = DB::table('laporan_locks')->where('bulan', $bulan)->where('tahun', $tahun)->first();
+            if ($lock) {
+                $isLocked = (bool) $lock->is_locked;
+            }
+        }
+
+        return Inertia::render('Admin/Produksi/Laporan', [
+            'data' => ['laporan' => $data],
+            'filters' => ['bulan' => $bulan, 'tahun' => $tahun, 'minggu' => $minggu, 'kategori' => $kategori],
+            'isLocked' => $isLocked
+        ]);
+    }
+
+    public function getGlobalData(Request $request)
+    {
+        $bulan = $request->query('bulan', date('n'));
+        $tahun = $request->query('tahun', date('Y'));
+        $minggu = $request->query('minggu', 'all');
 
         $monthFilter = $bulan === 'all' ? "" : "MONTH(tanggal) = " . (int)$bulan . " AND";
         
@@ -203,23 +258,11 @@ class LaporanProduksiController extends Controller
                 tonase,
                 total
             FROM laporans
-            WHERE $monthFilter $weekFilter YEAR(tanggal) = ? AND kategori = ?
-            ORDER BY tanggal ASC
-        ", [$tahun, $kategori]);
+            WHERE $monthFilter $weekFilter YEAR(tanggal) = ?
+            ORDER BY tanggal ASC, kategori ASC
+        ", [$tahun]);
 
-        $isLocked = false;
-        if ($bulan !== 'all') {
-            $lock = DB::table('laporan_locks')->where('bulan', $bulan)->where('tahun', $tahun)->first();
-            if ($lock) {
-                $isLocked = (bool) $lock->is_locked;
-            }
-        }
-
-        return Inertia::render('Admin/Produksi/Laporan', [
-            'data' => ['laporan' => $data],
-            'filters' => ['bulan' => $bulan, 'tahun' => $tahun, 'minggu' => $minggu, 'kategori' => $kategori],
-            'isLocked' => $isLocked
-        ]);
+        return response()->json($data);
     }
 
     public function storeLaporan(Request $request)

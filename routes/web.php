@@ -27,6 +27,7 @@ Route::middleware(['auth', 'verified'])->prefix('produksi')->group(function () {
     Route::get('/produktivitas', [LaporanProduksiController::class, 'produktivitas'])->name('produksi.produktivitas');
     Route::get('/kualitas', [LaporanProduksiController::class, 'kualitas'])->name('produksi.kualitas');
     Route::get('/laporan', [LaporanProduksiController::class, 'laporan'])->name('produksi.laporan');
+    Route::get('/laporan/global-data', [LaporanProduksiController::class, 'getGlobalData'])->name('produksi.laporan.globalData');
     Route::get('/laporan-brondol', function () {
         return redirect()->route('produksi.laporan', ['kategori' => 'Brondol']);
     });
